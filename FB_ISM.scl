@@ -1,0 +1,254 @@
+﻿TYPE "stISM_Status"
+VERSION : 0.1
+   STRUCT
+      usintState : USInt;   // aktualny stan
+      usintPrevState : USInt;   // poprzedni stan
+      sStateName : String[16];   // opcjonalnie (do HMI/www)
+      tStateTime : Time;   // czas w stanie
+      bInAuto : Bool;
+      bInManual : Bool;
+      bBusy : Bool;   // Starting/Stopping
+      bRunning : Bool;   // Running
+      bFaultActive : Bool;   // jesteśmy w Error
+      bFaultLatched : Bool;   // błąd zatrzaśnięty
+      usintFaultCode : USInt;   // kod błędu
+      sFaultText : String[32];   // tekst błędu
+   END_STRUCT;
+
+END_TYPE
+
+TYPE "eISM_State"
+VERSION : 0.1
+   STRUCT
+      usintStIdle : USInt;
+      usintStStarting : USInt := 10;
+      usintStRunning : USInt := 20;
+      usintStStopping : USInt := 30;
+      usintStError : USInt := 100;
+   END_STRUCT;
+
+END_TYPE
+
+FUNCTION_BLOCK "FB_ISM"
+{ S7_Optimized_Access := 'TRUE' }
+VERSION : 0.1
+   VAR_INPUT 
+      bEnable : Bool;
+      bModeAuto : Bool;
+      bCmdStart : Bool;
+      bCmdStop : Bool;
+      bCmdResetFault : Bool;
+      bFbRunning : Bool;
+      bInterlockOK : Bool;
+      bExternalFault : Bool;
+      tStartTimeout : Time := T#5s;
+      tStopTimeout : Time := T#5s;
+   END_VAR
+
+   VAR_OUTPUT 
+      bDoStart : Bool;
+      bDoStop : Bool;
+      stStatus : "stISM_Status";
+   END_VAR
+
+   VAR 
+      intState : USInt;
+      intNextState : USInt;
+      bStateInit : Bool;
+      tonTimeout {InstructionName := 'TON_TIME'; LibVersion := '1.0'; S7_SetPoint := 'False'} : TON_TIME;
+      tonStateTime {InstructionName := 'TON_TIME'; LibVersion := '1.0'} : TON_TIME;
+      bFaultLatched { S7_SetPoint := 'True'} : Bool;
+      usintFaultCode : USInt;
+      bStartReq : Bool;
+      bStopReq : Bool;
+      idle_const { ExternalAccessible := 'False'; ExternalVisible := 'False'; ExternalWritable := 'False'; S7_SetPoint := 'False'} : "eISM_State";
+   END_VAR
+
+
+BEGIN
+	// -------------------- Defaults --------------------
+	#bDoStart := FALSE;
+	#bDoStop := FALSE;
+	
+	#bStartReq := #bCmdStart AND NOT #bCmdStop;
+	#bStopReq := #bCmdStop;
+	
+	// licz czas w stanie (ET)
+	#tonStateTime(IN := #bEnable,
+	              PT := T#24H);
+	#stStatus.tStateTime := #tonStateTime.ET;
+	
+	
+	// -------------------- Enable / Fault handling --------------------
+	IF NOT #bEnable THEN
+	    // bezpiecznie wróć do Idle, ale nie kasuj faultów automatycznie
+	    #intState := #idle_const.usintStIdle;
+	    #intNextState := #idle_const.usintStIdle;
+	    #bStateInit := FALSE;
+	    
+	    #tonTimeout(IN := FALSE, PT:= #tStopTimeout);
+	    #tonStateTime(IN := FALSE, PT:=#tStartTimeout );
+	
+	    
+	ELSE
+	    // latch external fault
+	    IF #bExternalFault THEN
+	        #bFaultLatched := TRUE;
+	        #usintFaultCode := 3; // 3 = external fault (umownie)
+	        #intNextState := #idle_const.usintStError;
+	    END_IF;
+	    
+	    // reset fault
+	    IF #bCmdResetFault THEN
+	        #bFaultLatched := FALSE;
+	        #usintFaultCode := 0;
+	        IF #intState = #idle_const.usintStError THEN
+	            #intNextState := #idle_const.usintStIdle;
+	        END_IF;
+	    END_IF;
+	    
+	    // jeśli fault zatrzaśnięty -> wymuś Error
+	    IF #bFaultLatched THEN
+	        #intNextState := #idle_const.usintStError;
+	    END_IF;
+	    
+	    
+	    // -------------------- AUTO / MANUAL --------------------
+	    IF #bModeAuto THEN
+	        
+	        CASE #intState OF
+	                
+	            0 :
+	                IF NOT #bStateInit THEN
+	                    #bStateInit := TRUE;
+	                    #tonTimeout(IN := FALSE,
+	                                PT := #tStartTimeout);
+	                    #stStatus.sStateName := 'NOT WORKING';
+	                END_IF;
+	                
+	                IF #bStartReq THEN
+	                    IF #bInterlockOK THEN
+	                        #intNextState := #idle_const.usintStStarting;
+	                    ELSE
+	                        #bFaultLatched := TRUE;
+	                        #usintFaultCode := 1; // 1 = interlock
+	                        #intNextState := #idle_const.usintStError;
+	                    END_IF;
+	                END_IF;
+	                
+	                
+	            10:
+	                #bDoStart := TRUE;
+	                
+	                IF NOT #bStateInit THEN
+	                    #bStateInit := TRUE;
+	                    #tonTimeout(IN := TRUE,
+	                                PT := #tStartTimeout);
+	                END_IF;
+	                
+	                IF #bFbRunning THEN
+	                    #intNextState := #idle_const.usintStRunning;
+	                END_IF;
+	                
+	                IF #tonTimeout.Q THEN
+	                    #bFaultLatched := TRUE;
+	                    #usintFaultCode := 2; // 2 = start timeout
+	                    #intNextState := #idle_const.usintStError;
+	                END_IF;
+	                
+	                IF #bStopReq THEN
+	                    #intNextState := #idle_const.usintStStopping;
+	                END_IF;
+	                #stStatus.sStateName := 'STARTING';
+	                
+	                
+	            20:
+	                #bDoStart := TRUE;
+	                
+	                IF NOT #bInterlockOK THEN
+	                    #bFaultLatched := TRUE;
+	                    #usintFaultCode := 1; // interlock
+	                    #intNextState := #idle_const.usintStError;
+	                END_IF;
+	                
+	                IF NOT #bFbRunning THEN
+	                    #bFaultLatched := TRUE;
+	                    #usintFaultCode := 4; // 4 = feedback mismatch
+	                    #intNextState := #idle_const.usintStError;
+	                END_IF;
+	                
+	                IF #bStopReq THEN
+	                    #intNextState := #idle_const.usintStStopping;
+	                END_IF;
+	                #stStatus.sStateName := 'RUNNING';
+	                
+	                
+	            30:
+	                #bDoStop := TRUE;
+	                
+	                IF NOT #bStateInit THEN
+	                    #bStateInit := TRUE;
+	                    #tonTimeout(IN := TRUE,
+	                                PT := #tStopTimeout);
+	                END_IF;
+	                
+	                IF NOT #bFbRunning THEN
+	                    #intNextState := #idle_const.usintStIdle;
+	                END_IF;
+	                
+	                IF #tonTimeout.Q THEN
+	                    #bFaultLatched := TRUE;
+	                    #usintFaultCode := 5; // 5 = stop timeout
+	                    #intNextState := #idle_const.usintStError;
+	                END_IF;
+	                #stStatus.sStateName := 'STOPING';
+	                
+	            100:
+	                // bezpiecznie: stop
+	                #bDoStart := FALSE;
+	                #bDoStop := TRUE;
+	                #stStatus.sStateName := 'FAULT';
+	                
+	        END_CASE;
+	
+	        
+	    ELSE
+	        // MANUAL: proste sterowanie + brak auto-przejść
+	        #bDoStart := #bCmdStart AND #bInterlockOK AND NOT #bFaultLatched AND NOT #bExternalFault;
+	        #bDoStop := #bCmdStop;
+	        
+	        IF #bFbRunning THEN
+	            #intNextState := #idle_const.usintStRunning;
+	        ELSE
+	            #intNextState := #idle_const.usintStIdle;
+	        END_IF;
+	    END_IF;
+	    
+	    
+	    // -------------------- Centralne przejście stanu --------------------
+	    IF #intNextState <> #intState THEN
+	        #stStatus.usintPrevState := #intState;
+	        #intState := #intNextState;
+	        
+	        #bStateInit := FALSE;
+	        
+	        #tonTimeout(IN := FALSE,PT:=#tStopTimeout );
+	        #tonStateTime(IN := FALSE, PT:=#tStartTimeout );
+	    END_IF;
+	    
+	END_IF;
+	
+	
+	// -------------------- Status OUT --------------------
+	#stStatus.usintState := #intState;
+	#stStatus.bInAuto := #bModeAuto AND #bEnable;
+	#stStatus.bInManual := (NOT #bModeAuto) AND #bEnable;
+	
+	#stStatus.bBusy := (#intState = #idle_const.usintStStarting) OR (#intState = #idle_const.usintStStopping);
+	#stStatus.bRunning := (#intState = #idle_const.usintStRunning);
+	
+	#stStatus.bFaultLatched := #bFaultLatched;
+	#stStatus.bFaultActive := (#intState = #idle_const.usintStError);
+	#stStatus.usintFaultCode := #usintFaultCode;
+END_FUNCTION_BLOCK
+
